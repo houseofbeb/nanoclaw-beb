@@ -9,11 +9,13 @@ import {
   TRIGGER_PATTERN,
 } from './config.js';
 import { WhatsAppChannel } from './channels/whatsapp.js';
+import { DiscordChannel } from './channels/discord.js';
 import {
   ContainerOutput,
   runContainerAgent,
   writeGroupsSnapshot,
   writeTasksSnapshot,
+  startTokenRefreshLoop,
 } from './container-runner.js';
 import {
   cleanupOrphans,
@@ -40,6 +42,7 @@ import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -187,6 +190,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
+  await channel.sendMessage(chatJid, '...');
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
@@ -479,7 +483,35 @@ async function main(): Promise<void> {
   channels.push(whatsapp);
   await whatsapp.connect();
 
+  // Discord channel (optional — requires DISCORD_BOT_TOKEN + DISCORD_CHANNEL_ID in .env)
+  const discordEnv = readEnvFile(['DISCORD_BOT_TOKEN', 'DISCORD_CHANNEL_ID', 'DISCORD_GROUP_FOLDER']);
+  const discordToken = discordEnv.DISCORD_BOT_TOKEN;
+  const discordChannelId = discordEnv.DISCORD_CHANNEL_ID;
+  const discordGroupFolder = discordEnv.DISCORD_GROUP_FOLDER || 'bebbot';
+  if (discordToken && discordChannelId) {
+    const discord = new DiscordChannel({
+      token: discordToken,
+      channelId: discordChannelId,
+      onMessage: (_chatJid, msg) => {
+        storeMessage(msg);
+        queue.enqueueMessageCheck(discord.jid());
+      },
+      onChatMetadata: channelOpts.onChatMetadata,
+    });
+    channels.push(discord);
+    await discord.connect();
+    // Register the Discord JID pointing to the configured group folder
+    registerGroup(discord.jid(), {
+      name: 'discord',
+      folder: discordGroupFolder,
+      trigger: '',
+      added_at: new Date().toISOString(),
+      requiresTrigger: false,
+    });
+  }
+
   // Start subsystems (independently of connection handler)
+  startTokenRefreshLoop();
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,

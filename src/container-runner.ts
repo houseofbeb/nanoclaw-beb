@@ -4,6 +4,7 @@
  */
 import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
@@ -74,16 +75,16 @@ function buildVolumeMounts(
       readonly: true,
     });
 
-    // Shadow .env so the agent cannot read secrets from the mounted project root.
-    // Secrets are passed via stdin instead (see readSecrets()).
-    const envFile = path.join(projectRoot, '.env');
-    if (fs.existsSync(envFile)) {
-      mounts.push({
-        hostPath: '/dev/null',
-        containerPath: '/workspace/project/.env',
-        readonly: true,
-      });
-    }
+    // Shadow .env with an empty file so agents cannot read API keys.
+    // This mount is applied after the project root, so Docker overlays it.
+    const emptyEnvFile = path.join(projectRoot, 'store', '.env.empty');
+    fs.mkdirSync(path.dirname(emptyEnvFile), { recursive: true });
+    if (!fs.existsSync(emptyEnvFile)) fs.writeFileSync(emptyEnvFile, '');
+    mounts.push({
+      hostPath: emptyEnvFile,
+      containerPath: '/workspace/project/.env',
+      readonly: true,
+    });
 
     // Main also gets its group folder as the working directory
     mounts.push({
@@ -121,28 +122,39 @@ function buildVolumeMounts(
   );
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
-  if (!fs.existsSync(settingsFile)) {
-    fs.writeFileSync(
-      settingsFile,
-      JSON.stringify(
-        {
-          env: {
-            // Enable agent swarms (subagent orchestration)
-            // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
-            CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-            // Load CLAUDE.md from additional mounted directories
-            // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
-            CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-            // Enable Claude's memory feature (persists user preferences between sessions)
-            // https://code.claude.com/docs/en/memory#manage-auto-memory
-            CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-          },
-        },
-        null,
-        2,
-      ) + '\n',
-    );
-  }
+  const settingsContent = {
+    env: {
+      // Enable agent swarms (subagent orchestration)
+      // https://code.claude.com/docs/en/agent-teams#orchestrate-teams-of-claude-code-sessions
+      CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+      // Load CLAUDE.md from additional mounted directories
+      // https://code.claude.com/docs/en/memory#load-memory-from-additional-directories
+      CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+      // Enable Claude's memory feature (persists user preferences between sessions)
+      // https://code.claude.com/docs/en/memory#manage-auto-memory
+      CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+    },
+    mcpServers: {
+      ...(fs.existsSync(
+        path.join(
+          process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+          'google-calendar-mcp',
+          'tokens.json',
+        ),
+      )
+        ? {
+            'google-calendar': {
+              command: 'npx',
+              args: ['google-calendar-mcp'],
+            },
+          }
+        : {}),
+    },
+  };
+  fs.writeFileSync(
+    settingsFile,
+    JSON.stringify(settingsContent, null, 2) + '\n',
+  );
 
   // Sync skills from container/skills/ into each group's .claude/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
@@ -160,6 +172,29 @@ function buildVolumeMounts(
     containerPath: '/home/node/.claude',
     readonly: false,
   });
+
+  // Gmail MCP credentials (read-write so the MCP server can refresh OAuth tokens)
+  const gmailDir = path.join(os.homedir(), '.gmail-mcp');
+  if (fs.existsSync(gmailDir)) {
+    mounts.push({
+      hostPath: gmailDir,
+      containerPath: '/home/node/.gmail-mcp',
+      readonly: false,
+    });
+  }
+
+  // Google Calendar MCP tokens (read-write for token refresh)
+  const calendarConfigDir = path.join(
+    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+    'google-calendar-mcp',
+  );
+  if (fs.existsSync(calendarConfigDir)) {
+    mounts.push({
+      hostPath: calendarConfigDir,
+      containerPath: '/home/node/.config/google-calendar-mcp',
+      readonly: false,
+    });
+  }
 
   // Per-group IPC namespace: each group gets its own IPC directory
   // This prevents cross-group privilege escalation via IPC
@@ -211,16 +246,75 @@ function buildVolumeMounts(
 }
 
 /**
+ * Write credentials into the container's .claude/ dir so Agent SDK bridge
+ * subprocesses (which clear CLAUDE_CODE_OAUTH_TOKEN from their env) can
+ * still authenticate by reading ~/.claude/.credentials.json.
+ *
+ * Priority: CLAUDE_CODE_OAUTH_TOKEN from .env (setup-token) → host credentials.json
+ */
+function syncCredentialsToContainer(groupSessionsDir: string, token?: string): void {
+  const dstCredsFile = path.join(groupSessionsDir, '.credentials.json');
+
+  if (token) {
+    // Write a synthetic credentials file from the long-lived setup-token.
+    // expiresAt is set far in the future; Claude Code will use the token as-is.
+    const creds = {
+      claudeAiOauth: {
+        accessToken: token,
+        refreshToken: '',
+        expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000,
+      },
+    };
+    fs.writeFileSync(dstCredsFile, JSON.stringify(creds, null, 2));
+    return;
+  }
+
+  // Fallback: copy host credentials.json (used when no .env token is set)
+  const srcCredsFile = path.join(os.homedir(), '.claude', '.credentials.json');
+  try {
+    const raw = fs.readFileSync(srcCredsFile, 'utf-8');
+    const creds = JSON.parse(raw);
+    if (!creds?.claudeAiOauth?.accessToken) return;
+    fs.writeFileSync(dstCredsFile, raw);
+  } catch {
+    // No host credentials file — container falls back to ANTHROPIC_API_KEY
+  }
+}
+
+/**
+ * No-op kept for API compatibility with src/index.ts.
+ * Token refresh is now handled by Claude Code inside the container.
+ */
+export function startTokenRefreshLoop(): void {}
+
+/**
  * Read allowed secrets from .env for passing to the container via stdin.
  * Secrets are never written to disk or mounted as files.
+ *
+ * CLAUDE_CODE_OAUTH_TOKEN is read from credentials.json so the first-turn
+ * Claude Code subprocess gets it as an env var. Bridge subprocesses (which
+ * clear this var) fall back to the credentials file written by
+ * syncCredentialsToContainer. Claude Code inside the container refreshes
+ * the token itself if needed — NanoClaw never calls the refresh endpoint.
  */
 function readSecrets(): Record<string, string> {
-  return readEnvFile([
-    'CLAUDE_CODE_OAUTH_TOKEN',
-    'ANTHROPIC_API_KEY',
-    'ANTHROPIC_BASE_URL',
-    'ANTHROPIC_AUTH_TOKEN',
-  ]);
+  const secrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'GOOGLE_OAUTH_CREDENTIALS_JSON']);
+
+  if (!secrets['CLAUDE_CODE_OAUTH_TOKEN']) {
+    const credsFile = path.join(os.homedir(), '.claude', '.credentials.json');
+    try {
+      const creds = JSON.parse(fs.readFileSync(credsFile, 'utf-8'));
+      const token = creds?.claudeAiOauth?.accessToken;
+      if (token) {
+        secrets['CLAUDE_CODE_OAUTH_TOKEN'] = token;
+        delete secrets['ANTHROPIC_API_KEY'];
+      }
+    } catch {
+      // No credentials file — fall back to .env values
+    }
+  }
+
+  return secrets;
 }
 
 function buildContainerArgs(
@@ -297,6 +391,13 @@ export async function runContainerAgent(
   const logsDir = path.join(groupDir, 'logs');
   fs.mkdirSync(logsDir, { recursive: true });
 
+  // Sync refreshed credentials into the container's .claude/ dir so that
+  // Agent SDK bridge subprocesses (which clear CLAUDE_CODE_OAUTH_TOKEN) can
+  // authenticate by reading ~/.claude/.credentials.json normally.
+  const groupSessionsDir = path.join(DATA_DIR, 'sessions', group.folder, '.claude');
+  const secrets = readSecrets();
+  syncCredentialsToContainer(groupSessionsDir, secrets['CLAUDE_CODE_OAUTH_TOKEN']);
+
   return new Promise((resolve) => {
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -310,7 +411,10 @@ export async function runContainerAgent(
     let stderrTruncated = false;
 
     // Pass secrets via stdin (never written to disk or mounted as files)
-    input.secrets = readSecrets();
+    // CLAUDE_CODE_OAUTH_TOKEN is only used as a last-resort fallback here;
+    // credentials are primarily delivered via the .credentials.json file
+    // written by syncCredentialsToContainer above.
+    input.secrets = secrets;
     container.stdin.write(JSON.stringify(input));
     container.stdin.end();
     // Remove secrets from input so they don't appear in logs

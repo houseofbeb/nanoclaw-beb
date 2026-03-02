@@ -21,6 +21,10 @@ groups/global/*
 # Secrets
 *.keys.json
 .env
+.beblergoogle.json
+
+# Database
+*.db
 
 # OS
 .DS_Store
