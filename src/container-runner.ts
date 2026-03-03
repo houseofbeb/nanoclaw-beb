@@ -281,11 +281,62 @@ function syncCredentialsToContainer(groupSessionsDir: string, token?: string): v
   }
 }
 
-/**
- * No-op kept for API compatibility with src/index.ts.
- * Token refresh is now handled by Claude Code inside the container.
- */
-export function startTokenRefreshLoop(): void {}
+const OAUTH_TOKEN_URL = 'https://platform.claude.com/v1/oauth/token';
+const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers';
+const REFRESH_CHECK_INTERVAL_MS = 5 * 60 * 1000; // check every 5 minutes
+const REFRESH_AHEAD_MS = 10 * 60 * 1000; // refresh when <10 min remain
+
+async function refreshOAuthToken(credsFile: string): Promise<void> {
+  const raw = fs.readFileSync(credsFile, 'utf-8');
+  const creds = JSON.parse(raw);
+  const oauth = creds?.claudeAiOauth;
+  if (!oauth?.refreshToken || !oauth?.expiresAt) return;
+
+  // Only refresh if expiring soon
+  if (oauth.expiresAt - Date.now() > REFRESH_AHEAD_MS) return;
+
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: oauth.refreshToken,
+    client_id: OAUTH_CLIENT_ID,
+    scope: OAUTH_SCOPES,
+  });
+
+  const res = await fetch(OAUTH_TOKEN_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: body.toString(),
+  });
+
+  if (!res.ok) {
+    logger.error({ status: res.status }, 'OAuth token refresh failed');
+    return;
+  }
+
+  const data = await res.json() as { access_token: string; refresh_token?: string; expires_in: number };
+  creds.claudeAiOauth.accessToken = data.access_token;
+  if (data.refresh_token) creds.claudeAiOauth.refreshToken = data.refresh_token;
+  creds.claudeAiOauth.expiresAt = Date.now() + data.expires_in * 1000;
+  fs.writeFileSync(credsFile, JSON.stringify(creds, null, 2), { mode: 0o600 });
+  logger.info('OAuth token refreshed successfully');
+}
+
+export function startTokenRefreshLoop(): void {
+  // Only run when using host credentials (not a setup-token from .env)
+  const envSecrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']);
+  if (envSecrets['CLAUDE_CODE_OAUTH_TOKEN']) return;
+
+  const credsFile = path.join(os.homedir(), '.claude', '.credentials.json');
+  if (!fs.existsSync(credsFile)) return;
+
+  const run = () =>
+    refreshOAuthToken(credsFile).catch(err => logger.error({ err }, 'OAuth token refresh error'));
+
+  // Check immediately at startup, then on interval
+  run();
+  setInterval(run, REFRESH_CHECK_INTERVAL_MS);
+}
 
 /**
  * Read allowed secrets from .env for passing to the container via stdin.
