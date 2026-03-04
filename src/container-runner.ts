@@ -286,15 +286,16 @@ const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const OAUTH_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers';
 const REFRESH_CHECK_INTERVAL_MS = 5 * 60 * 1000; // check every 5 minutes
 const REFRESH_AHEAD_MS = 10 * 60 * 1000; // refresh when <10 min remain
+const FORCE_REFRESH_INTERVAL_MS = 6 * 60 * 60 * 1000; // proactive refresh every 6 hours
 
-async function refreshOAuthToken(credsFile: string): Promise<void> {
+async function refreshOAuthToken(credsFile: string, force = false): Promise<void> {
   const raw = fs.readFileSync(credsFile, 'utf-8');
   const creds = JSON.parse(raw);
   const oauth = creds?.claudeAiOauth;
   if (!oauth?.refreshToken || !oauth?.expiresAt) return;
 
-  // Only refresh if expiring soon
-  if (oauth.expiresAt - Date.now() > REFRESH_AHEAD_MS) return;
+  // Only refresh if expiring soon (unless forced)
+  if (!force && oauth.expiresAt - Date.now() > REFRESH_AHEAD_MS) return;
 
   const body = new URLSearchParams({
     grant_type: 'refresh_token',
@@ -319,7 +320,70 @@ async function refreshOAuthToken(credsFile: string): Promise<void> {
   if (data.refresh_token) creds.claudeAiOauth.refreshToken = data.refresh_token;
   creds.claudeAiOauth.expiresAt = Date.now() + data.expires_in * 1000;
   fs.writeFileSync(credsFile, JSON.stringify(creds, null, 2), { mode: 0o600 });
-  logger.info('OAuth token refreshed successfully');
+  logger.info({ force }, 'OAuth token refreshed successfully');
+}
+
+const GOOGLE_CALENDAR_TOKEN_REFRESH_INTERVAL_MS = 45 * 60 * 1000; // refresh every 45 minutes
+
+async function refreshGoogleCalendarToken(): Promise<void> {
+  const configDir = path.join(
+    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+    'google-calendar-mcp',
+  );
+  const keysFile = path.join(configDir, 'gcp-oauth.keys.json');
+  const tokensFile = path.join(configDir, 'tokens.json');
+
+  if (!fs.existsSync(keysFile) || !fs.existsSync(tokensFile)) return;
+
+  const keys = JSON.parse(fs.readFileSync(keysFile, 'utf-8'));
+  const tokens = JSON.parse(fs.readFileSync(tokensFile, 'utf-8'));
+
+  // tokens.json has a top-level key per account (e.g. "normal")
+  for (const account of Object.keys(tokens)) {
+    const t = tokens[account];
+    if (!t?.refresh_token) continue;
+
+    const body = new URLSearchParams({
+      grant_type: 'refresh_token',
+      refresh_token: t.refresh_token,
+      client_id: keys.client_id,
+      client_secret: keys.client_secret,
+    });
+
+    const res = await fetch('https://oauth2.googleapis.com/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+    });
+
+    if (!res.ok) {
+      logger.error({ account, status: res.status }, 'Google Calendar token refresh failed');
+      continue;
+    }
+
+    const data = await res.json() as { access_token: string; expires_in: number };
+    tokens[account].access_token = data.access_token;
+    tokens[account].expiry_date = Date.now() + data.expires_in * 1000;
+    logger.info({ account }, 'Google Calendar token refreshed');
+  }
+
+  fs.writeFileSync(tokensFile, JSON.stringify(tokens, null, 2), { mode: 0o600 });
+}
+
+export function startGoogleCalendarTokenRefreshLoop(): void {
+  const configDir = path.join(
+    process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config'),
+    'google-calendar-mcp',
+  );
+  if (!fs.existsSync(path.join(configDir, 'tokens.json'))) return;
+
+  const run = () =>
+    refreshGoogleCalendarToken().catch(err =>
+      logger.error({ err }, 'Google Calendar token refresh error'),
+    );
+
+  run();
+  setInterval(run, GOOGLE_CALENDAR_TOKEN_REFRESH_INTERVAL_MS);
 }
 
 export function startTokenRefreshLoop(): void {
@@ -333,9 +397,15 @@ export function startTokenRefreshLoop(): void {
   const run = () =>
     refreshOAuthToken(credsFile).catch(err => logger.error({ err }, 'OAuth token refresh error'));
 
+  const forceRun = () =>
+    refreshOAuthToken(credsFile, true).catch(err => logger.error({ err }, 'OAuth token scheduled refresh error'));
+
   // Check immediately at startup, then on interval
   run();
   setInterval(run, REFRESH_CHECK_INTERVAL_MS);
+
+  // Proactively refresh every 6 hours regardless of expiry
+  setInterval(forceRun, FORCE_REFRESH_INTERVAL_MS);
 }
 
 /**
@@ -349,7 +419,7 @@ export function startTokenRefreshLoop(): void {
  * the token itself if needed — NanoClaw never calls the refresh endpoint.
  */
 function readSecrets(): Record<string, string> {
-  const secrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'GOOGLE_OAUTH_CREDENTIALS_JSON']);
+  const secrets = readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY', 'GOOGLE_OAUTH_CREDENTIALS_JSON', 'HA_URL', 'HA_TOKEN']);
 
   if (!secrets['CLAUDE_CODE_OAUTH_TOKEN']) {
     const credsFile = path.join(os.homedir(), '.claude', '.credentials.json');
@@ -394,6 +464,10 @@ function buildContainerArgs(
       args.push('-v', `${mount.hostPath}:${mount.containerPath}`);
     }
   }
+
+  // Allow containers to reach the host (e.g. Home Assistant on --network host)
+  // via the host.docker.internal hostname, which resolves to the bridge gateway.
+  args.push('--add-host=host.docker.internal:host-gateway');
 
   args.push(CONTAINER_IMAGE);
 

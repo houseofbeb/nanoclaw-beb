@@ -85,7 +85,7 @@ vi.mock('child_process', async () => {
   };
 });
 
-import { runContainerAgent, ContainerOutput } from './container-runner.js';
+import { runContainerAgent, ContainerOutput, startTokenRefreshLoop } from './container-runner.js';
 import type { RegisteredGroup } from './types.js';
 
 const testGroup: RegisteredGroup = {
@@ -205,5 +205,79 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('success');
     expect(result.newSessionId).toBe('session-456');
+  });
+});
+
+describe('startTokenRefreshLoop', () => {
+  const CREDS_FILE = '/home/testuser/.claude/.credentials.json';
+
+  const makeCreds = (expiresOffsetMs: number) =>
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: 'old-access-token',
+        refreshToken: 'refresh-token-abc',
+        expiresAt: Date.now() + expiresOffsetMs,
+      },
+    });
+
+  const mockFetch = vi.fn();
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', mockFetch);
+    mockFetch.mockReset();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('does not refresh a token with plenty of time remaining on the 5-min check', async () => {
+    const fs = await import('fs');
+    const fsMock = vi.mocked(fs.default);
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(makeCreds(60 * 60 * 1000)); // 1 hour left
+
+    // env mock: no CLAUDE_CODE_OAUTH_TOKEN → use credentials file path
+    vi.doMock('./env.js', () => ({ readEnvFile: () => ({}) }));
+
+    startTokenRefreshLoop();
+
+    // Advance past one 5-min poll cycle
+    await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 10);
+
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('force-refreshes after 6 hours regardless of expiry', async () => {
+    const fs = await import('fs');
+    const fsMock = vi.mocked(fs.default);
+    fsMock.existsSync.mockReturnValue(true);
+    fsMock.readFileSync.mockReturnValue(makeCreds(24 * 60 * 60 * 1000)); // 24 hours left
+
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        access_token: 'new-access-token',
+        refresh_token: 'new-refresh-token',
+        expires_in: 28800,
+      }),
+    });
+
+    fsMock.writeFileSync.mockClear();
+    startTokenRefreshLoop();
+
+    // Advance to just past the 6-hour forced refresh interval
+    await vi.advanceTimersByTimeAsync(6 * 60 * 60 * 1000 + 10);
+
+    expect(mockFetch).toHaveBeenCalledOnce();
+    expect(mockFetch).toHaveBeenCalledWith(
+      'https://platform.claude.com/v1/oauth/token',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(fsMock.writeFileSync).toHaveBeenCalled();
+    const written = JSON.parse((fsMock.writeFileSync.mock.calls[0][1] as string));
+    expect(written.claudeAiOauth.accessToken).toBe('new-access-token');
   });
 });

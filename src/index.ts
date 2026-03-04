@@ -16,6 +16,7 @@ import {
   writeGroupsSnapshot,
   writeTasksSnapshot,
   startTokenRefreshLoop,
+  startGoogleCalendarTokenRefreshLoop,
 } from './container-runner.js';
 import {
   cleanupOrphans,
@@ -512,6 +513,7 @@ async function main(): Promise<void> {
 
   // Start subsystems (independently of connection handler)
   startTokenRefreshLoop();
+  startGoogleCalendarTokenRefreshLoop();
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
