@@ -113,6 +113,17 @@ export class DiscordChannel implements Channel {
     });
   }
 
+  async reactToMessage(_jid: string, messageId: string, emoji: string): Promise<void> {
+    try {
+      const channel = await this.client.channels.fetch(this.opts.channelId);
+      if (!(channel instanceof TextChannel)) return;
+      const msg = await channel.messages.fetch(messageId);
+      await msg.react(emoji);
+    } catch (err) {
+      logger.warn({ messageId, err }, 'Failed to react to Discord message');
+    }
+  }
+
   async sendMessage(_jid: string, text: string): Promise<void> {
     const channel = await this.client.channels.fetch(this.opts.channelId);
     if (!channel || !(channel instanceof TextChannel)) {

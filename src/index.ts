@@ -23,6 +23,7 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
+  deleteSession,
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
@@ -191,7 +192,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  await channel.sendMessage(chatJid, '...');
+  const lastMsgId = missedMessages[missedMessages.length - 1].id;
+  await channel.reactToMessage?.(chatJid, lastMsgId, '👀');
   await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
@@ -294,12 +296,12 @@ async function runAgent(
       }
     : undefined;
 
-  try {
-    const output = await runContainerAgent(
+  const invokeAgent = async (sid: string | undefined) =>
+    runContainerAgent(
       group,
       {
         prompt,
-        sessionId,
+        sessionId: sid,
         groupFolder: group.folder,
         chatJid,
         isMain,
@@ -309,6 +311,24 @@ async function runAgent(
         queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
     );
+
+  try {
+    let output = await invokeAgent(sessionId);
+
+    // If the session history contains expired image URLs, clear the session and retry fresh
+    if (
+      output.status === 'error' &&
+      output.error?.includes('Could not process image') &&
+      sessionId
+    ) {
+      logger.warn(
+        { group: group.name },
+        'Image error with session history — clearing session and retrying',
+      );
+      delete sessions[group.folder];
+      deleteSession(group.folder);
+      output = await invokeAgent(undefined);
+    }
 
     if (output.newSessionId) {
       sessions[group.folder] = output.newSessionId;
@@ -408,7 +428,13 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
-            // Show typing indicator while the container processes the piped message
+            // React with eyes and show typing indicator while container processes
+            const lastPipedId = groupMessages[groupMessages.length - 1].id;
+            channel
+              .reactToMessage?.(chatJid, lastPipedId, '👀')
+              ?.catch((err) =>
+                logger.warn({ chatJid, err }, 'Failed to react to message'),
+              );
             channel
               .setTyping?.(chatJid, true)
               ?.catch((err) =>

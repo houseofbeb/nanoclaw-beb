@@ -14,6 +14,7 @@ import {
   writeTasksSnapshot,
 } from './container-runner.js';
 import {
+  deleteSession,
   getAllTasks,
   getDueTasks,
   getTaskById,
@@ -132,12 +133,12 @@ async function runTask(
     }, TASK_CLOSE_DELAY_MS);
   };
 
-  try {
+  const runWithSession = async (sid: string | undefined) => {
     const output = await runContainerAgent(
       group,
       {
         prompt: task.prompt,
-        sessionId,
+        sessionId: sid,
         groupFolder: task.group_folder,
         chatJid: task.chat_jid,
         isMain,
@@ -161,6 +162,30 @@ async function runTask(
         }
       },
     );
+    return output;
+  };
+
+  try {
+    let output = await runWithSession(sessionId);
+
+    // If the session history contains expired image URLs, clear the session and retry fresh
+    const isImageError = (msg: string) => msg.includes('Could not process image');
+    if (
+      output.status === 'error' &&
+      output.error &&
+      isImageError(output.error) &&
+      sessionId
+    ) {
+      logger.warn(
+        { taskId: task.id, groupFolder: task.group_folder },
+        'Image error with session history — clearing session and retrying',
+      );
+      deleteSession(task.group_folder);
+      // Reset result/error for the retry
+      result = null;
+      error = null;
+      output = await runWithSession(undefined);
+    }
 
     if (closeTimer) clearTimeout(closeTimer);
 
